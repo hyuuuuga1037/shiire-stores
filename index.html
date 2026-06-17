@@ -222,7 +222,9 @@ function normKey(name){
   s=s.replace(/[Ａ-Ｚａ-ｚ０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xFEE0));
   s=s.toLowerCase();
   s=s.replace(/ユーズレッド/g,'ユーズレット');
-  s=s.replace(/^(スーパーセカンドストリート|セカンドストリート|セカスト|sss|ss)/,'★ss');
+  // SS(セカンドストリート)とSSS(スーパーセカンドストリート)は別店舗。先にSSS系を判定
+  if(/^(スーパーセカンドストリート|sss)/.test(s)) s=s.replace(/^(スーパーセカンドストリート|sss)/,'★sss');
+  else if(/^(セカンドストリート|セカスト|ss)/.test(s)) s=s.replace(/^(セカンドストリート|セカスト|ss)/,'★ss');
   s=s.replace(/店$/,'');
   return s;
 }
