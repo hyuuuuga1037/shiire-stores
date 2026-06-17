@@ -87,6 +87,7 @@
   .store-last .days.warn{ color:var(--warn); }
   .store-stats{ font-size:12px; color:#666; margin-top:5px; }
   .store-stats b{ color:#222; font-weight:bold; }
+  .store-merge{ font-size:11px; color:#0F766E; margin-top:5px; cursor:help; }
 
   /* ---- settings ---- */
   details.settings summary{ cursor:pointer; font-size:13px; font-weight:bold; color:var(--accent); list-style:none; }
@@ -99,6 +100,9 @@
   .kw button{ background:none; border:none; color:#94A3B8; cursor:pointer; font-size:14px; line-height:1; padding:0; }
   .kw-add{ display:flex; gap:6px; }
   .kw-add input{ flex:1; padding:7px 10px; font-size:13px; border:1px solid var(--line); border-radius:8px; }
+  .merge-add{ display:flex; flex-direction:column; gap:6px; }
+  .merge-add input{ width:100%; padding:7px 10px; font-size:13px; border:1px solid var(--line); border-radius:8px; }
+  .merge-add button{ align-self:flex-start; background:var(--accent); color:#fff; border:none; border-radius:8px; padding:7px 16px; font-size:13px; cursor:pointer; }
   .kw-add button, .num-row button{ background:var(--accent); color:#fff; border:none; border-radius:8px; padding:7px 12px; font-size:13px; cursor:pointer; }
   .num-row{ display:flex; align-items:center; gap:8px; }
   .num-row input{ width:80px; padding:7px 10px; font-size:13px; border:1px solid var(--line); border-radius:8px; }
@@ -136,16 +140,23 @@ let _db = null;
 const SETTINGS_KEY = 'shiire_settings';
 const DEFAULT_ONLINE_KW = ['メルカリ','ゾゾタウン','ZOZO','ベクトルパーク','ベクトル','ラクマ','ヤフオク','ヤフーフリマ','楽天','Amazon','アマゾン','オンライン','おたからや','ジモティ'];
 const DEFAULT_THRESHOLD = 60;
+// 店舗名の手動統合（別表記 → 正式名）。自動ルールで拾えない表記違い用
+const DEFAULT_MERGES = {
+  'セカンドストリート鶴瀬店':'セカンドストリートつるせ店',
+  'トレファク大宮店':'トレジャーファクトリー大宮店',
+  'OFF HOUSE 三橋店':'オフハウスさいたま三橋店'
+};
 
 function getSettings(){
   try{
     const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
     return {
       onlineKeywords: Array.isArray(s.onlineKeywords) ? s.onlineKeywords : DEFAULT_ONLINE_KW.slice(),
-      threshold: Number.isFinite(s.threshold) ? s.threshold : DEFAULT_THRESHOLD
+      threshold: Number.isFinite(s.threshold) ? s.threshold : DEFAULT_THRESHOLD,
+      merges: (s.merges && typeof s.merges==='object') ? s.merges : Object.assign({}, DEFAULT_MERGES)
     };
   }catch(e){
-    return { onlineKeywords: DEFAULT_ONLINE_KW.slice(), threshold: DEFAULT_THRESHOLD };
+    return { onlineKeywords: DEFAULT_ONLINE_KW.slice(), threshold: DEFAULT_THRESHOLD, merges: Object.assign({}, DEFAULT_MERGES) };
   }
 }
 function saveSettings(s){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
@@ -200,18 +211,43 @@ function normalizeDate(raw){
   }
   return {iso:null, inferred:false};
 }
+
+// ---- 店舗名の名寄せ（同じ店を同一キーに） ----
+// 手動統合（別表記→正式名）を適用
+function applyAlias(name){ const m=getSettings().merges||{}; return m[name]||name; }
+// グルーピング用キー：全角半角・大小・空白・末尾「店」を吸収し、セカスト系の略称を統一
+function normKey(name){
+  let s=(name||'').trim();
+  s=s.replace(/[\s　]+/g,'');
+  s=s.replace(/[Ａ-Ｚａ-ｚ０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xFEE0));
+  s=s.toLowerCase();
+  s=s.replace(/ユーズレッド/g,'ユーズレット');
+  s=s.replace(/^(スーパーセカンドストリート|セカンドストリート|セカスト|sss|ss)/,'★ss');
+  s=s.replace(/店$/,'');
+  return s;
+}
+// 表示用の整形：空白除去＋セカスト系の略称を正式名に展開（地図検索の精度も上がる）
+function prettyName(name){
+  let s=(name||'').replace(/[\s　]+/g,'');
+  if(/^(sss|ＳＳＳ)/i.test(s)) s=s.replace(/^(sss|ＳＳＳ)/i,'スーパーセカンドストリート');
+  else if(/^(ss|ＳＳ)/i.test(s)) s=s.replace(/^(ss|ＳＳ)/i,'セカンドストリート');
+  else if(/^セカスト/.test(s)) s=s.replace(/^セカスト/,'セカンドストリート');
+  return s;
+}
 function yen(n){ return '¥'+(n||0).toLocaleString('ja-JP'); }
 function esc(s){ return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // ==================== 集計 ====================
 // 店舗ごとに集計（purchaseSource 完全一致でグルーピング）
 function aggregateStores(){
-  const map = new Map();
+  const map = new Map();   // key=normKey(別名適用後) → グループ
   _items.forEach(it=>{
-    const name = (it.purchaseSource||'').trim();
-    if(!name) return;
-    if(!map.has(name)) map.set(name, { name, itemCount:0, dates:new Set(), totalSpent:0, lastDate:null, lastInferred:false });
-    const g = map.get(name);
+    const raw = (it.purchaseSource||'').trim();
+    if(!raw) return;
+    const key = normKey(applyAlias(raw));
+    if(!map.has(key)) map.set(key, { variants:new Set(), itemCount:0, dates:new Set(), totalSpent:0, lastDate:null, lastInferred:false });
+    const g = map.get(key);
+    g.variants.add(raw);
     g.itemCount++;
     g.totalSpent += (Number(it.purchasePrice)||0);
     const iso = it._iso;            // 正規化済み（補完含む）
@@ -220,16 +256,23 @@ function aggregateStores(){
       if(!g.lastDate || iso > g.lastDate){ g.lastDate = iso; g.lastInferred = it._inferred; }
     }
   });
-  return [...map.values()].map(g=>({
-    name: g.name,
-    itemCount: g.itemCount,
-    visitCount: g.dates.size,
-    totalSpent: g.totalSpent,
-    lastDate: g.lastDate,
-    lastInferred: g.lastInferred,
-    days: daysSince(g.lastDate),
-    online: isOnline(g.name)
-  }));
+  return [...map.values()].map(g=>{
+    const aliased = [...g.variants].map(applyAlias);
+    let disp = aliased.reduce((a,b)=> b.length>a.length ? b : a, '');  // 最も詳しい表記を採用
+    disp = prettyName(disp);
+    return {
+      name: disp,
+      variants: [...g.variants],
+      variantCount: g.variants.size,
+      itemCount: g.itemCount,
+      visitCount: g.dates.size,
+      totalSpent: g.totalSpent,
+      lastDate: g.lastDate,
+      lastInferred: g.lastInferred,
+      days: daysSince(g.lastDate),
+      online: isOnline(disp)
+    };
+  });
 }
 
 // 期間内の店舗:ネット比率（点数・金額）
@@ -364,6 +407,7 @@ function renderList(){
       </div>
       <div class="store-last">${lastLine}</div>
       <div class="store-stats"><b>${s.itemCount}</b>点仕入れ ・ <b>${s.visitCount}</b>回来店 ・ 仕入総額 <b>${yen(s.totalSpent)}</b></div>
+      ${s.variantCount>1?`<div class="store-merge" title="${esc(s.variants.join('  /  '))}">🔗 別表記 ${s.variantCount}件をまとめて集計（タップで確認）</div>`:''}
     </div>`;
   }).join('');
 
@@ -377,6 +421,7 @@ function renderList(){
 function renderSettingsUI(){
   const s = getSettings();
   const kws = s.onlineKeywords.map((kw,i)=>`<span class="kw">${esc(kw)}<button onclick="removeKw(${i})" title="削除">✕</button></span>`).join('');
+  const mergeRows = Object.entries(s.merges).map(([k,v],i)=>`<span class="kw">${esc(k)} → ${esc(v)}<button onclick="removeMerge(${i})" title="削除">✕</button></span>`).join('');
   return `<div class="card">
     <details class="settings">
       <summary>設定</summary>
@@ -394,6 +439,15 @@ function renderSettingsUI(){
           <input id="th-input" type="number" min="1" value="${s.threshold}">
           <span style="font-size:13px;color:#555">日以上で強調</span>
           <button onclick="saveThreshold()">保存</button>
+        </div>
+      </div>
+      <div class="set-block">
+        <p class="ctrl-label">店舗名の統合（別表記 → 正式名）。SS／全角半角などの主な揺れは自動で統合済み。自動で拾えない表記違いはここで追加</p>
+        <div class="kw-list">${mergeRows||'<span style="font-size:12px;color:#999">（なし）</span>'}</div>
+        <div class="merge-add">
+          <input id="merge-from" type="text" placeholder="別表記（例：セカンドストリート鶴瀬店）">
+          <input id="merge-to" type="text" placeholder="正式名（例：セカンドストリートつるせ店）">
+          <button onclick="addMerge()">追加</button>
         </div>
       </div>
     </details>
@@ -441,7 +495,18 @@ function saveThreshold(){
   s.threshold = (Number.isFinite(v)&&v>0)?v:DEFAULT_THRESHOLD;
   saveSettings(s);
   render();
-  setTimeout(()=>{ const d=document.querySelector('details.settings'); if(d) d.open=true; },0);
+  reopenSettings();
+}
+function reopenSettings(){ setTimeout(()=>{ const d=document.querySelector('details.settings'); if(d) d.open=true; },0); }
+function addMerge(){
+  const f=(document.getElementById('merge-from').value||'').trim();
+  const t=(document.getElementById('merge-to').value||'').trim();
+  if(!f||!t) return;
+  const s=getSettings(); s.merges[f]=t; saveSettings(s); render(); reopenSettings();
+}
+function removeMerge(i){
+  const s=getSettings(); const k=Object.keys(s.merges)[i];
+  if(k!==undefined){ delete s.merges[k]; saveSettings(s); render(); reopenSettings(); }
 }
 
 // ==================== データ読み込み ====================
