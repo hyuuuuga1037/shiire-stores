@@ -192,20 +192,43 @@ function daysSince(dateStr){
   return Math.floor((today - d)/86400000);
 }
 function _iso(y,mo,da){ const p=x=>String(x).padStart(2,'0'); return y+'-'+p(mo)+'-'+p(da); }
-// 年なしM/Dは「今日基準で最も近い過去の年」に補完
+// 年ありの明示的な日付表記のみを解釈（ISO/スラッシュ形式）。年なしM/Dはここでは扱わない
+function explicitIso(raw){
+  const d=(raw||'').trim();
+  let m;
+  if(m=d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)) return _iso(+m[1],+m[2],+m[3]);
+  if(m=d.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/)) return _iso(+m[1],+m[2],+m[3]);
+  return null;
+}
+// 「年あり日付での記録に切り替わった日」＝実データ中で最初に現れたISO日付。
+// これ以降の日付は必ず年あり記録になっているはずなので、年なしM/Dがこの日以降を指す
+// 候補になった場合は「今年ではありえない」と判断し前年扱いにする（過去の入力の名残りのため）。
+let _isoCutover = null;
+function computeIsoCutover(rawDates){
+  let min=null;
+  rawDates.forEach(raw=>{
+    const iso = explicitIso(raw);
+    if(iso && (!min || iso < min)) min = iso;
+  });
+  return min;
+}
+// 年なしM/Dの年を補完。cutover以降になる候補は「まだ年あり記録に切り替わっていなかった頃」の
+// ものとみなせないので前年に、それ以外は「今日基準で最も近い過去の年」に補完する。
 function inferYear(mo, day){
   const n = new Date();
   const today = new Date(n.getFullYear(), n.getMonth(), n.getDate());
   const cand = new Date(n.getFullYear(), mo-1, day);
+  const candIso = _iso(n.getFullYear(), mo, day);
+  if(_isoCutover && candIso >= _isoCutover) return n.getFullYear()-1;
   return cand <= today ? n.getFullYear() : n.getFullYear()-1;
 }
 // 各種日付表記を {iso:'YYYY-MM-DD'|null, inferred:bool} に正規化
 function normalizeDate(raw){
   const d=(raw||'').trim();
   if(!d) return {iso:null, inferred:false};
+  const explicit = explicitIso(d);
+  if(explicit) return {iso:explicit, inferred:false};
   let m;
-  if(m=d.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)) return {iso:_iso(+m[1],+m[2],+m[3]), inferred:false};
-  if(m=d.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/)) return {iso:_iso(+m[1],+m[2],+m[3]), inferred:false};
   if(m=d.match(/^(\d{1,2})\/(\d{1,2})$/)){
     const mo=+m[1], da=+m[2];
     if(mo>=1&&mo<=12&&da>=1&&da<=31) return {iso:_iso(inferYear(mo,da),mo,da), inferred:true};
@@ -520,17 +543,18 @@ function loadData(){
   _loaded=false; _loadError=''; render();
   _db.collection('inventory').get()
     .then(snap=>{
-      const arr=[];
-      snap.forEach(doc=>{
-        const d=doc.data()||{};
+      const rawDocs=[];
+      snap.forEach(doc=> rawDocs.push(doc.data()||{}));
+      _isoCutover = computeIsoCutover(rawDocs.map(d=>d.purchaseDate||''));
+      const arr = rawDocs.map(d=>{
         const nd = normalizeDate(d.purchaseDate||'');
-        arr.push({
+        return {
           purchaseSource: d.purchaseSource||'',
           purchaseDate: d.purchaseDate||'',
           purchasePrice: Number(d.purchasePrice)||0,
           _iso: nd.iso,
           _inferred: nd.inferred
-        });
+        };
       });
       _items=arr; _loaded=true; render();
     })
